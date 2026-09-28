@@ -79,15 +79,7 @@ where
         R: Register + Readable,
     {
         let mut r = R::read();
-        let buffer = R::buffer(&mut r);
-
-        init_header::<R>(false, buffer);
-        self.0
-            .spi
-            .transfer_in_place(buffer)
-            .await
-            .map_err(Error::Transfer)?;
-
+        self.0.read_raw(R::ID, R::SUB_ID, R::buffer(&mut r)).await?;
         Ok(r)
     }
 
@@ -101,15 +93,7 @@ where
     {
         let mut w = R::write();
         f(&mut w);
-
-        let buffer = R::buffer(&mut w);
-        init_header::<R>(true, buffer);
-
-        SPI::write(&mut self.0.spi, buffer)
-            .await
-            .map_err(Error::Transfer)?;
-
-        Ok(())
+        self.0.write_raw(R::ID, R::SUB_ID, R::buffer(&mut w)).await
     }
 
     /// Modify the register
@@ -127,14 +111,39 @@ where
 
         f(&mut r, &mut w);
 
-        let buffer = <R as Writable>::buffer(&mut w);
-        init_header::<R>(true, buffer);
-
-        SPI::write(&mut self.0.spi, buffer)
+        self.0
+            .write_raw(R::ID, R::SUB_ID, <R as Writable>::buffer(&mut w))
             .await
-            .map_err(Error::Transfer)?;
+    }
+}
 
-        Ok(())
+impl<SPI> DW3000<SPI>
+where
+    SPI: spi_type::spi::SpiDevice<u8>,
+{
+    // The register accessors above are generic over the register type. Doing the
+    // SPI transfer out of line here keeps it from being duplicated for every
+    // register access, which saves a lot of flash.
+
+    /// Read a register into `buffer`, which includes room for the header
+    #[inline(never)]
+    #[maybe_async_attr]
+    async fn read_raw(&mut self, id: u8, sub_id: u8, buffer: &mut [u8]) -> Result<(), Error<SPI>> {
+        init_header(false, id, sub_id, buffer);
+        self.spi
+            .transfer_in_place(buffer)
+            .await
+            .map_err(Error::Transfer)
+    }
+
+    /// Write `buffer`, which includes room for the header, to a register
+    #[inline(never)]
+    #[maybe_async_attr]
+    async fn write_raw(&mut self, id: u8, sub_id: u8, buffer: &mut [u8]) -> Result<(), Error<SPI>> {
+        init_header(true, id, sub_id, buffer);
+        SPI::write(&mut self.spi, buffer)
+            .await
+            .map_err(Error::Transfer)
     }
 }
 
@@ -195,16 +204,16 @@ where
 /// TODO: Here we always use the full address, but we should also support the
 /// short address mode and masked write mode.
 #[inline(always)]
-fn init_header<R: Register>(write: bool, buffer: &mut [u8]) -> usize {
+fn init_header(write: bool, id: u8, sub_id: u8, buffer: &mut [u8]) -> usize {
     // bool write defines if we are in read or write mode (first bit)
     // sub_id is a bool that defines if we are in full or short command
     // we start with full address!
     buffer[0] = (((write as u8) << 7) & 0x80)
         | (1u8 << 6) // We always use 2-octet addressing
-        | ((R::ID << 1) & 0x3e) // 5-bit base address
-        | ((R::SUB_ID >> 6) & 0x01); // MSB of the 7-bit sub-address
+        | ((id << 1) & 0x3e) // 5-bit base address
+        | ((sub_id >> 6) & 0x01); // MSB of the 7-bit sub-address
 
-    buffer[1] = R::SUB_ID << 2; // last two bits M1 M0 are always 0
+    buffer[1] = sub_id << 2; // last two bits M1 M0 are always 0
 
     2
 }
@@ -321,96 +330,11 @@ macro_rules! impl_register {
                         #[$field_doc]
                         #[inline(always)]
                         pub fn $field(&self) -> $ty {
-                            use core::mem::size_of;
-                            use crate::ll::FromBytes;
-
-                            // The index (in the register data) of the first
-                            // byte that contains a part of this field.
-                            const START: usize = $first_bit / 8;
-
-                            // The index (in the register data) of the byte
-                            // after the last byte that contains a part of this
-                            // field.
-                            const END: usize = $last_bit  / 8 + 1;
-
-                            // The number of bytes in the register data that
-                            // contain part of this field.
-                            const LEN: usize = END - START;
-
-                            // Get all bytes that contain our field. The field
-                            // might fill out these bytes completely, or only
-                            // some bits in them.
-                            let mut bytes = [0; LEN];
-                            bytes[..LEN].copy_from_slice(
-                                &self.0[START+HEADER_LEN .. END+HEADER_LEN]
-                            );
-
-                            // Before we can convert the field into a number and
-                            // return it, we need to shift it, to make sure
-                            // there are no other bits to the right of it. Let's
-                            // start by determining the offset of the field
-                            // within a byte.
-                            const OFFSET_IN_BYTE: usize = $first_bit % 8;
-
-                            if OFFSET_IN_BYTE > 0 {
-                                // Shift the first byte. We always have at least
-                                // one byte here, so this always works.
-                                bytes[0] >>= OFFSET_IN_BYTE;
-
-                                // If there are more bytes, let's shift those
-                                // too.
-                                // We need to allow exceeding bitshifts in this
-                                // loop, as we run into that if `OFFSET_IN_BYTE`
-                                // equals `0`. Please note that we never
-                                // actually encounter that at runtime, due to
-                                // the if condition above.
-                                let mut i = 1;
-                                #[allow(arithmetic_overflow)]
-                                while i < LEN {
-                                    bytes[i - 1] |=
-                                        bytes[i] << 8 - OFFSET_IN_BYTE;
-                                    bytes[i] >>= OFFSET_IN_BYTE;
-                                    i += 1;
-                                }
-                            }
-
-                            // If the field didn't completely fill out its last
-                            // byte, we might have bits from unrelated fields
-                            // there. Let's erase those before doing the final
-                            // conversion into the field's data type.
-                            const SIZE_IN_BITS: usize =
-                                $last_bit - $first_bit + 1;
-                            const BITS_ABOVE_FIELD: usize =
-                                8 - (SIZE_IN_BITS % 8);
-                            const SIZE_IN_BYTES: usize =
-                                (SIZE_IN_BITS - 1) / 8 + 1;
-                            const LAST_INDEX: usize =
-                                SIZE_IN_BYTES - 1;
-                            if BITS_ABOVE_FIELD < 8 {
-                                // Need to allow exceeding bitshifts to make the
-                                // compiler happy. They're never actually
-                                // encountered at runtime, due to the if
-                                // condition.
-                                #[allow(arithmetic_overflow)]
-                                {
-                                    bytes[LAST_INDEX] <<= BITS_ABOVE_FIELD;
-                                    bytes[LAST_INDEX] >>= BITS_ABOVE_FIELD;
-                                }
-                            }
-
-                            // Now all that's left is to convert the bytes into
-                            // the field's type. Please note that methods for
-                            // converting numbers to/from bytes are coming to
-                            // stable Rust, so we might be able to remove our
-                            // custom infrastructure here. Tracking issue:
-                            // https://github.com/rust-lang/rust/issues/52963
-                            let bytes = if bytes.len() > size_of::<$ty>() {
-                                &bytes[..size_of::<$ty>()]
-                            }
-                            else {
-                                &bytes
-                            };
-                            <$ty as FromBytes>::from_bytes(bytes)
+                            crate::ll::read_field(
+                                &self.0[HEADER_LEN..],
+                                $first_bit,
+                                $last_bit,
+                            ) as $ty
                         }
                     )*
                 }
@@ -445,115 +369,12 @@ macro_rules! impl_register {
                         #[$field_doc]
                         #[inline(always)]
                         pub fn $field(&mut self, value: $ty) -> &mut Self {
-                            use crate::ll::ToBytes;
-
-                            // Convert value into bytes
-                            let source = <$ty as ToBytes>::to_bytes(value);
-
-                            // Now, let's figure out where the bytes are located
-                            // within the register array.
-                            const START:          usize = $first_bit / 8;
-                            const END:            usize = $last_bit  / 8 + 1;
-                            const OFFSET_IN_BYTE: usize = $first_bit % 8;
-
-                            // Also figure out the length of the value in bits.
-                            // That's going to come in handy.
-                            const LEN: usize = $last_bit - $first_bit + 1;
-
-
-                            // We need to track how many bits are left in the
-                            // value overall, and in the value's current byte.
-                            let mut bits_left         = LEN;
-                            let mut bits_left_in_byte = 8;
-
-                            // We also need to track how many bits have already
-                            // been written to the current target byte.
-                            let mut bits_written_to_byte = 0;
-
-                            // Now we can take the bytes from the value, shift
-                            // them, mask them, and write them into the target
-                            // array.
-                            let mut source_i  = 0;
-                            let mut target_i  = START;
-                            while target_i < END {
-                                // Values don't always end at byte boundaries,
-                                // so we need to mask the bytes when writing to
-                                // the slice.
-                                // Let's start out assuming we can write to the
-                                // whole byte of the slice. This will be true
-                                // for the middle bytes of our value.
-                                let mut mask = 0xff;
-
-                                // Let's keep track of the offset we're using to
-                                // write to this byte. We're going to need it.
-                                let mut offset_in_this_byte = 0;
-
-                                // If this is the first byte we're writing to
-                                // the slice, we need to remove the lower bits
-                                // of the mask.
-                                if target_i == START {
-                                    mask <<= OFFSET_IN_BYTE;
-                                    offset_in_this_byte = OFFSET_IN_BYTE;
-                                }
-
-                                // If this is the last byte we're writing to the
-                                // slice, we need to remove the higher bits of
-                                // the mask. Please note that we could be
-                                // writing to _both_ the first and the last
-                                // byte.
-                                if target_i == END - 1 {
-                                    let shift =
-                                        8 - bits_left - offset_in_this_byte;
-                                    mask <<= shift;
-                                    mask >>= shift;
-                                }
-
-                                mask <<= bits_written_to_byte;
-
-                                // Read the value from `source`
-                                let value = source[source_i]
-                                    >> 8 - bits_left_in_byte
-                                    << offset_in_this_byte
-                                    << bits_written_to_byte;
-
-                                // Zero the target bits in the slice, then write
-                                // the value.
-                                self.0[HEADER_LEN + target_i] &= !mask;
-                                self.0[HEADER_LEN + target_i] |= value & mask;
-
-                                // The number of bits that were expected to be
-                                // written to the target byte.
-                                let bits_needed = mask.count_ones() as usize;
-
-                                // The number of bits we actually wrote to the
-                                // target byte.
-                                let bits_used = bits_needed.min(
-                                    bits_left_in_byte - offset_in_this_byte
-                                );
-
-                                bits_left -= bits_used;
-                                bits_written_to_byte += bits_used;
-
-                                // Did we use up all the bits in the source
-                                // byte? If so, we can move on to the next one.
-                                if bits_left_in_byte > bits_used {
-                                    bits_left_in_byte -= bits_used;
-                                }
-                                else {
-                                    bits_left_in_byte =
-                                        8 - (bits_used - bits_left_in_byte);
-
-                                    source_i += 1;
-                                }
-
-                                // Did we write all the bits in the target byte?
-                                // If so, we can move on to the next one.
-                                if bits_used == bits_needed {
-                                    target_i += 1;
-                                    bits_written_to_byte = 0;
-                                }
-                            }
-
+                            crate::ll::write_field(
+                                &mut self.0[HEADER_LEN..],
+                                $first_bit,
+                                $last_bit,
+                                value as u64,
+                            );
                             self
                         }
                     )*
@@ -1823,58 +1644,81 @@ pub mod rx_buffer_1 {
     }
 }
 
-/// Internal trait used by `impl_registers!`
-trait FromBytes {
-    fn from_bytes(bytes: &[u8]) -> Self;
+// The field accessors generated by `impl_register!` call these instead of
+// doing the bit manipulation inline. That code used to be expanded for every
+// field access, which cost a lot of flash. Register access is limited by the
+// SPI transfer anyway, so doing it one bit at a time here is fast enough.
+
+/// Read the bits `first_bit..=last_bit` of `reg`, the register data without
+/// header
+#[inline(never)]
+fn read_field(reg: &[u8], first_bit: usize, last_bit: usize) -> u64 {
+    let mut value = 0;
+    for bit in first_bit..=last_bit {
+        let b = (reg[bit / 8] >> (bit % 8)) & 1;
+        value |= (b as u64) << (bit - first_bit);
+    }
+    value
 }
 
-/// Internal trait used by `impl_registers!`
-trait ToBytes {
-    type Bytes;
-
-    fn to_bytes(self) -> Self::Bytes;
-}
-
-/// Internal macro used to implement `FromBytes`/`ToBytes`
-macro_rules! impl_bytes {
-    ($($ty:ty,)*) => {
-        $(
-            impl FromBytes for $ty {
-                fn from_bytes(bytes: &[u8]) -> Self {
-                    let mut val = 0;
-
-                    for (i, &b) in bytes.iter().enumerate() {
-                        val |= (b as $ty) << (i * 8);
-                    }
-
-                    val
-                }
-            }
-
-            impl ToBytes for $ty {
-                type Bytes = [u8; ::core::mem::size_of::<$ty>()];
-
-                fn to_bytes(self) -> Self::Bytes {
-                    let mut bytes = [0; ::core::mem::size_of::<$ty>()];
-
-                    for (i, b) in bytes.iter_mut().enumerate() {
-                        let shift = 8 * i;
-                        let mask  = 0xff << shift;
-
-                        *b = ((self & mask) >> shift) as u8;
-                    }
-
-                    bytes
-                }
-            }
-        )*
+/// Write `value` to the bits `first_bit..=last_bit` of `reg`, the register
+/// data without header. Bits of `value` that don't fit are silently dropped.
+#[inline(never)]
+fn write_field(reg: &mut [u8], first_bit: usize, last_bit: usize, value: u64) {
+    for bit in first_bit..=last_bit {
+        let mask = 1 << (bit % 8);
+        if (value >> (bit - first_bit)) & 1 != 0 {
+            reg[bit / 8] |= mask;
+        } else {
+            reg[bit / 8] &= !mask;
+        }
     }
 }
 
-impl_bytes! {
-    u8,
-    u16,
-    u32,
-    u64,
-    u128,
+#[cfg(test)]
+mod tests {
+    use super::{read_field, write_field};
+
+    #[test]
+    fn field_within_one_byte() {
+        let mut reg = [0xff, 0x00];
+        write_field(&mut reg, 2, 4, 0b010);
+        assert_eq!(reg, [0b1110_1011, 0x00]);
+        assert_eq!(read_field(&reg, 2, 4), 0b010);
+    }
+
+    #[test]
+    fn field_across_bytes() {
+        let mut reg = [0x00; 3];
+        write_field(&mut reg, 4, 15, 0xabc);
+        assert_eq!(reg, [0xc0, 0xab, 0x00]);
+        assert_eq!(read_field(&reg, 4, 15), 0xabc);
+    }
+
+    #[test]
+    fn value_is_truncated_to_field_width() {
+        let mut reg = [0x00; 2];
+        write_field(&mut reg, 0, 3, 0xff);
+        assert_eq!(reg, [0x0f, 0x00]);
+    }
+
+    #[test]
+    fn full_64_bit_field_with_offset() {
+        let mut reg = [0x00; 9];
+        write_field(&mut reg, 4, 67, u64::MAX);
+        assert_eq!(read_field(&reg, 4, 67), u64::MAX);
+        assert_eq!(reg[0], 0xf0);
+        assert_eq!(reg[8], 0x0f);
+    }
+
+    #[test]
+    fn register_accessors() {
+        // SYS_CFG: phr_mode is bit 4, cp_spc bits 12..=13
+        let mut w = super::sys_cfg::W([0; 2 + 4]);
+        w.phr_mode(1).cp_spc(0b11);
+        let r = super::sys_cfg::R(w.0);
+        assert_eq!(r.phr_mode(), 1);
+        assert_eq!(r.cp_spc(), 0b11);
+        assert_eq!(&w.0[2..], &[0x10, 0x30, 0x00, 0x00]);
+    }
 }
